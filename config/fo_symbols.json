@@ -1,0 +1,40 @@
+{
+  "indices": [
+    "NIFTY",
+    "BANKNIFTY",
+    "FINNIFTY",
+    "MIDCPNIFTY"
+  ],
+  "stocks": [
+    "RELIANCE",
+    "TCS",
+    "INFY",
+    "HDFCBANK",
+    "ICICIBANK",
+    "HINDUNILVR",
+    "ITC",
+    "SBIN",
+    "BHARTIARTL",
+    "KOTAKBANK",
+    "LT",
+    "AXISBANK",
+    "BAJFINANCE",
+    "ASIANPAINT",
+    "MARUTI",
+    "TITAN",
+    "SUNPHARMA",
+    "ULTRACEMCO",
+    "NESTLEIND",
+    "WIPRO",
+    "HCLTECH",
+    "TECHM",
+    "TATAMOTORS",
+    "TATASTEEL",
+    "ADANIPORTS",
+    "POWERGRID",
+    "ONGC",
+    "NTPC",
+    "COALINDIA",
+    "GRASIM"
+  ]
+}

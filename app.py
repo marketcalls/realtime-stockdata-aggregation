@@ -11,6 +11,9 @@ from config_manager import ConfigManager
 from questdb_client import QuestDBClient
 from openalgo_client import OpenAlgoStreamClient
 from candle_aggregator import CandleAggregator
+from symbol_manager import SymbolManager
+from atm_calculator import ATMCalculator
+from openalgo_oi_fetcher import OpenAlgoOIFetcher
 
 # Suppress stdout from OpenAlgo SDK
 class SuppressOutput:
@@ -48,6 +51,11 @@ config_manager = ConfigManager()
 questdb_client = QuestDBClient()
 stream_client = None
 candle_aggregator = CandleAggregator(questdb_client)
+
+# Initialize market profile components (will be set up after OpenAlgo client is available)
+symbol_manager = None
+atm_calculator = None
+oi_fetcher = None
 
 # Store real-time metrics
 metrics = {
@@ -433,6 +441,48 @@ def handle_unsubscribe(data):
         leave_room(room)
         app.logger.info(f"Client {request.sid} unsubscribed from {room}")
 
+# =====================================================
+# Market Profile WebSocket Events
+# =====================================================
+
+@socketio.on('subscribe_market_profile')
+def handle_subscribe_market_profile(data):
+    """Subscribe to market profile updates for symbol+expiry"""
+    symbol = data.get('symbol')
+    expiry = data.get('expiry')
+
+    if symbol and expiry:
+        room = f"market_profile_{symbol}_{expiry}"
+        join_room(room)
+        app.logger.info(f"Client {request.sid} subscribed to market profile: {room}")
+
+        emit('subscribed', {
+            'symbol': symbol,
+            'expiry': expiry,
+            'message': f'Subscribed to {symbol} {expiry}'
+        })
+
+@socketio.on('unsubscribe_market_profile')
+def handle_unsubscribe_market_profile(data):
+    """Unsubscribe from market profile updates"""
+    symbol = data.get('symbol')
+    expiry = data.get('expiry')
+
+    if symbol and expiry:
+        room = f"market_profile_{symbol}_{expiry}"
+        leave_room(room)
+        app.logger.info(f"Client {request.sid} unsubscribed from market profile: {room}")
+
+def broadcast_oi_update(symbol, expiry, oi_data):
+    """Broadcast OI update to subscribed clients"""
+    room = f"market_profile_{symbol}_{expiry}"
+    socketio.emit('oi_update', {
+        'symbol': symbol,
+        'expiry': expiry,
+        'data': oi_data,
+        'timestamp': datetime.now().isoformat()
+    }, room=room)
+
 def broadcast_candle_update(symbol, timeframe, candle):
     """Broadcast candle update to subscribed clients"""
     room = f"{symbol}_{timeframe}"
@@ -441,6 +491,385 @@ def broadcast_candle_update(symbol, timeframe, candle):
         'timeframe': timeframe,
         'candle': candle
     }, room=room)
+
+# =====================================================
+# Market Profile Routes
+# =====================================================
+
+def init_market_profile_components():
+    """Initialize market profile components with OpenAlgo client"""
+    global symbol_manager, atm_calculator, oi_fetcher
+
+    config = config_manager.get_config()
+    api_key = config.get('api_key')
+
+    if not api_key:
+        app.logger.warning("No API key configured, market profile features disabled")
+        return False
+
+    try:
+        # Import OpenAlgo client
+        from openalgo import api as openalgo_api
+
+        # Initialize OpenAlgo client for market profile
+        openalgo_client = openalgo_api(
+            api_key=api_key,
+            host=config.get('rest_host', 'http://127.0.0.1:5000')
+        )
+
+        # Initialize components
+        symbol_manager = SymbolManager(openalgo_client)
+        atm_calculator = ATMCalculator(symbol_manager)
+        oi_fetcher = OpenAlgoOIFetcher(openalgo_client, questdb_client, symbol_manager)
+
+        app.logger.info("Market profile components initialized successfully")
+        return True
+
+    except Exception as e:
+        app.logger.error(f"Failed to initialize market profile components: {e}")
+        return False
+
+@app.route('/market-profile')
+def market_profile_page():
+    """Render market profile UI"""
+    # Ensure components are initialized
+    if symbol_manager is None:
+        init_market_profile_components()
+
+    return render_template('market_profile.html')
+
+@app.route('/api/fo-symbols')
+def get_fo_symbols():
+    """Get list of all F&O symbols"""
+    try:
+        if symbol_manager is None:
+            init_market_profile_components()
+
+        if symbol_manager:
+            symbols = symbol_manager.get_fo_symbols()
+            return jsonify({
+                'status': 'success',
+                'symbols': symbols
+            })
+        else:
+            return jsonify({
+                'status': 'error',
+                'message': 'Market profile not initialized'
+            }), 500
+
+    except Exception as e:
+        app.logger.error(f"Error getting F&O symbols: {e}")
+        return jsonify({
+            'status': 'error',
+            'message': str(e)
+        }), 500
+
+@app.route('/api/expiry/<symbol>')
+def get_expiry_dates(symbol):
+    """Get expiry dates for a symbol"""
+    try:
+        if symbol_manager is None:
+            init_market_profile_components()
+
+        if not symbol_manager:
+            return jsonify({
+                'status': 'error',
+                'message': 'Market profile not initialized'
+            }), 500
+
+        exchange = request.args.get('exchange', 'NFO')
+        force_refresh = request.args.get('refresh', 'false').lower() == 'true'
+
+        # Get expiries with automatic filtering for stocks
+        expiries = symbol_manager.get_expiries_for_symbol(symbol, exchange)
+
+        if not expiries:
+            return jsonify({
+                'status': 'error',
+                'message': f'No expiry dates found for {symbol}'
+            }), 404
+
+        return jsonify({
+            'status': 'success',
+            'symbol': symbol,
+            'exchange': exchange,
+            'expiries': expiries,
+            'next_expiry': expiries[0] if expiries else None,
+            'is_index': symbol_manager.is_index(symbol),
+            'is_stock': symbol_manager.is_stock(symbol)
+        })
+
+    except Exception as e:
+        app.logger.error(f"Error getting expiries for {symbol}: {e}")
+        return jsonify({
+            'status': 'error',
+            'message': str(e)
+        }), 500
+
+@app.route('/api/atm/<symbol>')
+def get_current_atm(symbol):
+    """Get current ATM strike and underlying price"""
+    try:
+        if not oi_fetcher or not atm_calculator:
+            init_market_profile_components()
+
+        if not oi_fetcher or not atm_calculator:
+            return jsonify({
+                'status': 'error',
+                'message': 'Market profile not initialized'
+            }), 500
+
+        exchange = request.args.get('exchange', 'NSE')
+
+        # Fetch underlying price
+        underlying_price = oi_fetcher.fetch_underlying_price(symbol, exchange)
+
+        if not underlying_price:
+            return jsonify({
+                'status': 'error',
+                'message': f'Could not fetch price for {symbol}'
+            }), 404
+
+        # Calculate ATM
+        atm = atm_calculator.calculate_atm(symbol, underlying_price)
+
+        return jsonify({
+            'status': 'success',
+            'symbol': symbol,
+            'underlying_price': underlying_price,
+            'atm_strike': atm,
+            'strike_interval': symbol_manager.get_strike_interval(symbol),
+            'timestamp': datetime.now().isoformat()
+        })
+
+    except Exception as e:
+        app.logger.error(f"Error calculating ATM for {symbol}: {e}")
+        return jsonify({
+            'status': 'error',
+            'message': str(e)
+        }), 500
+
+@app.route('/api/market-profile/<symbol>')
+def get_market_profile(symbol):
+    """Get complete market profile data for symbol"""
+    try:
+        if not all([symbol_manager, atm_calculator, oi_fetcher]):
+            init_market_profile_components()
+
+        if not all([symbol_manager, atm_calculator, oi_fetcher]):
+            return jsonify({
+                'status': 'error',
+                'message': 'Market profile not initialized'
+            }), 500
+
+        expiry = request.args.get('expiry')
+        exchange = request.args.get('exchange', 'NFO')
+        underlying_exchange = request.args.get('underlying_exchange', 'NSE')
+
+        if not expiry:
+            return jsonify({
+                'status': 'error',
+                'message': 'Expiry parameter is required'
+            }), 400
+
+        # Get underlying price
+        underlying_price = oi_fetcher.fetch_underlying_price(symbol, underlying_exchange)
+
+        if not underlying_price:
+            return jsonify({
+                'status': 'error',
+                'message': f'Could not fetch price for {symbol}'
+            }), 404
+
+        # Calculate ATM
+        atm = atm_calculator.calculate_atm(symbol, underlying_price)
+
+        # Get futures candles (5m, 7 days)
+        futures_candles = candle_aggregator.get_historical_candles(
+            symbol=symbol,
+            timeframe='5m',
+            limit=2016  # 7 days * 24 hours * 12 (5-min intervals per hour)
+        )
+
+        # Get current OI levels
+        oi_data = questdb_client.get_oi_for_expiry(symbol, expiry, exchange)
+
+        # Get daily OI changes
+        oi_changes = questdb_client.calculate_oi_changes(symbol, expiry, exchange)
+
+        # Calculate PCR (Put-Call Ratio)
+        total_ce_oi = sum(data.get('oi', 0) for data in oi_data.get('CE', {}).values())
+        total_pe_oi = sum(data.get('oi', 0) for data in oi_data.get('PE', {}).values())
+        pcr = total_pe_oi / total_ce_oi if total_ce_oi > 0 else 0
+
+        return jsonify({
+            'status': 'success',
+            'symbol': symbol,
+            'exchange': exchange,
+            'expiry': expiry,
+            'timestamp': datetime.now().isoformat(),
+            'underlying_price': underlying_price,
+            'atm_strike': atm,
+            'strike_interval': symbol_manager.get_strike_interval(symbol),
+            'pcr': round(pcr, 2),
+            'futures_candles': futures_candles,
+            'oi_levels': oi_data,
+            'oi_changes': oi_changes,
+            'total_ce_oi': total_ce_oi,
+            'total_pe_oi': total_pe_oi
+        })
+
+    except Exception as e:
+        app.logger.error(f"Error getting market profile for {symbol}: {e}")
+        return jsonify({
+            'status': 'error',
+            'message': str(e)
+        }), 500
+
+@app.route('/api/fetch-oi/<symbol>')
+def fetch_oi_data(symbol):
+    """Manually trigger OI data fetch for a symbol/expiry"""
+    try:
+        if not all([symbol_manager, atm_calculator, oi_fetcher]):
+            init_market_profile_components()
+
+        if not all([symbol_manager, atm_calculator, oi_fetcher]):
+            return jsonify({
+                'status': 'error',
+                'message': 'Market profile not initialized'
+            }), 500
+
+        expiry = request.args.get('expiry')
+        exchange = request.args.get('exchange', 'NFO')
+
+        if not expiry:
+            return jsonify({
+                'status': 'error',
+                'message': 'Expiry parameter is required'
+            }), 400
+
+        # Get underlying price and calculate ATM
+        underlying_price = oi_fetcher.fetch_underlying_price(symbol)
+        if not underlying_price:
+            return jsonify({
+                'status': 'error',
+                'message': f'Could not fetch price for {symbol}'
+            }), 404
+
+        atm = atm_calculator.calculate_atm(symbol, underlying_price)
+
+        # Fetch option chain
+        option_chain = oi_fetcher.fetch_option_chain(
+            symbol, expiry, atm, strike_range=20, exchange=exchange
+        )
+
+        return jsonify({
+            'status': 'success',
+            'message': f'Fetched OI data for {symbol} {expiry}',
+            'symbol': symbol,
+            'expiry': expiry,
+            'atm': atm,
+            'strikes_fetched': len(option_chain.get('CE', {})) + len(option_chain.get('PE', {}))
+        })
+
+    except Exception as e:
+        app.logger.error(f"Error fetching OI for {symbol}: {e}")
+        return jsonify({
+            'status': 'error',
+            'message': str(e)
+        }), 500
+
+@app.route('/api/start-oi-fetch/<symbol>', methods=['POST'])
+def start_oi_fetch(symbol):
+    """Start periodic OI fetch for a symbol/expiry"""
+    try:
+        if not all([symbol_manager, atm_calculator, oi_fetcher]):
+            init_market_profile_components()
+
+        if not all([symbol_manager, atm_calculator, oi_fetcher]):
+            return jsonify({
+                'status': 'error',
+                'message': 'Market profile not initialized'
+            }), 500
+
+        data = request.json
+        expiry = data.get('expiry')
+        exchange = data.get('exchange', 'NFO')
+        interval = data.get('interval', 300)  # 5 minutes default
+
+        if not expiry:
+            return jsonify({
+                'status': 'error',
+                'message': 'Expiry is required'
+            }), 400
+
+        # Get ATM
+        underlying_price = oi_fetcher.fetch_underlying_price(symbol)
+        if not underlying_price:
+            return jsonify({
+                'status': 'error',
+                'message': f'Could not fetch price for {symbol}'
+            }), 404
+
+        atm = atm_calculator.calculate_atm(symbol, underlying_price)
+
+        # Start periodic fetch
+        fetch_key = oi_fetcher.start_periodic_fetch(
+            symbol, expiry, atm, interval_seconds=interval, exchange=exchange
+        )
+
+        return jsonify({
+            'status': 'success',
+            'message': f'Started periodic OI fetch for {symbol} {expiry}',
+            'fetch_key': fetch_key,
+            'interval_seconds': interval
+        })
+
+    except Exception as e:
+        app.logger.error(f"Error starting OI fetch for {symbol}: {e}")
+        return jsonify({
+            'status': 'error',
+            'message': str(e)
+        }), 500
+
+@app.route('/api/stop-oi-fetch/<symbol>', methods=['POST'])
+def stop_oi_fetch(symbol):
+    """Stop periodic OI fetch for a symbol/expiry"""
+    try:
+        if not oi_fetcher:
+            return jsonify({
+                'status': 'error',
+                'message': 'OI fetcher not initialized'
+            }), 500
+
+        data = request.json
+        expiry = data.get('expiry')
+
+        if not expiry:
+            return jsonify({
+                'status': 'error',
+                'message': 'Expiry is required'
+            }), 400
+
+        success = oi_fetcher.stop_periodic_fetch(symbol, expiry)
+
+        if success:
+            return jsonify({
+                'status': 'success',
+                'message': f'Stopped OI fetch for {symbol} {expiry}'
+            })
+        else:
+            return jsonify({
+                'status': 'error',
+                'message': f'No active fetch found for {symbol} {expiry}'
+            }), 404
+
+    except Exception as e:
+        app.logger.error(f"Error stopping OI fetch for {symbol}: {e}")
+        return jsonify({
+            'status': 'error',
+            'message': str(e)
+        }), 500
 
 if __name__ == '__main__':
     # Start candle aggregator

@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="supabass">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Market Profile - OpenQuest</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://cdn.jsdelivr.net/npm/daisyui@4.4.2/dist/full.min.css" rel="stylesheet">
+    <script src="https://unpkg.com/lightweight-charts@4.1.0/dist/lightweight-charts.standalone.production.js"></script>
+    <style>
+        :root {
+            --primary: #10b981;
+            --primary-focus: #059669;
+            --secondary: #000000;
+            --accent: #10b981;
+            --neutral: #1a1a1a;
+            --base-100: #000000;
+            --base-200: #0a0a0a;
+            --base-300: #141414;
+        }
+
+        [data-theme="supabass"] {
+            --p: 158 60% 43%;
+            --pf: 158 60% 33%;
+            --s: 0 0% 0%;
+            --a: 158 60% 43%;
+            --n: 0 0% 10%;
+            --b1: 0 0% 0%;
+            --b2: 0 0% 4%;
+            --b3: 0 0% 8%;
+            --bc: 158 60% 90%;
+            --sc: 158 60% 90%;
+            --ac: 0 0% 0%;
+            --nc: 158 60% 90%;
+        }
+
+        #futures-chart {
+            height: calc(100vh - 280px);
+            min-height: 500px;
+        }
+
+        .oi-chart {
+            height: calc(100vh - 280px);
+            min-height: 500px;
+            overflow-y: auto;
+        }
+
+        .strike-row {
+            display: flex;
+            align-items: center;
+            padding: 4px 0;
+            border-bottom: 1px solid #1a1a1a;
+        }
+
+        .strike-row:hover {
+            background: #0a0a0a;
+        }
+
+        .strike-label {
+            min-width: 70px;
+            text-align: center;
+            font-weight: bold;
+            font-size: 12px;
+        }
+
+        .atm-row {
+            background: rgba(255, 215, 0, 0.1);
+            border: 1px solid rgba(255, 215, 0, 0.5);
+        }
+
+        .atm-row .strike-label {
+            color: #FFD700;
+        }
+
+        .oi-bar-ce, .oi-bar-pe {
+            height: 20px;
+            transition: width 0.3s ease;
+        }
+
+        .oi-bar-ce {
+            background: linear-gradient(90deg, transparent, #10b981);
+            margin-left: auto;
+        }
+
+        .oi-bar-pe {
+            background: linear-gradient(270deg, transparent, #ef4444);
+            margin-right: auto;
+        }
+
+        .oi-change-positive {
+            background: linear-gradient(90deg, transparent, rgba(16, 185, 129, 0.6));
+        }
+
+        .oi-change-negative {
+            background: linear-gradient(90deg, transparent, rgba(239, 68, 68, 0.6));
+        }
+
+        .metric-badge {
+            background: linear-gradient(135deg, #0a0a0a 0%, #141414 100%);
+            border: 1px solid #10b981;
+        }
+
+        .column-header {
+            background: #0a0a0a;
+            border-bottom: 2px solid #10b981;
+            padding: 12px;
+            font-weight: bold;
+            text-align: center;
+            color: #10b981;
+        }
+
+        .loading-spinner {
+            border: 3px solid #1a1a1a;
+            border-top: 3px solid #10b981;
+            border-radius: 50%;
+            width: 40px;
+            height: 40px;
+            animation: spin 1s linear infinite;
+            margin: 20px auto;
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+    </style>
+</head>
+<body class="bg-base-100 text-green-400">
+    <div class="container mx-auto p-4">
+        <!-- Header -->
+        <div class="navbar bg-base-200 rounded-lg mb-4 shadow-xl border border-green-900">
+            <div class="flex-1">
+                <h1 class="text-2xl font-bold text-green-400">Market Profile</h1>
+                <a href="/" class="ml-4 btn btn-ghost btn-sm text-green-600">← Dashboard</a>
+                <a href="/chart" class="ml-2 btn btn-ghost btn-sm text-green-600">Charts</a>
+            </div>
+            <div class="flex-none gap-2">
+                <div id="fetch-status" class="badge badge-ghost">Ready</div>
+                <div id="last-update" class="badge badge-ghost">No data</div>
+            </div>
+        </div>
+
+        <!-- Controls -->
+        <div class="card bg-base-200 shadow-xl mb-4 border border-green-900">
+            <div class="card-body p-4">
+                <div class="flex flex-wrap gap-4 items-center">
+                    <!-- Symbol Selector -->
+                    <div class="form-control">
+                        <label class="label py-0"><span class="label-text text-xs">Symbol</span></label>
+                        <select id="symbol-selector" class="select select-bordered select-sm bg-base-300 border-green-700 text-green-300">
+                            <option value="" disabled selected>Loading...</option>
+                        </select>
+                    </div>
+
+                    <!-- Expiry Selector -->
+                    <div class="form-control">
+                        <label class="label py-0"><span class="label-text text-xs">Expiry</span></label>
+                        <select id="expiry-selector" class="select select-bordered select-sm bg-base-300 border-green-700 text-green-300" disabled>
+                            <option value="">Select Symbol First</option>
+                        </select>
+                    </div>
+
+                    <!-- Fetch Data Button -->
+                    <div class="form-control">
+                        <label class="label py-0"><span class="label-text text-xs">&nbsp;</span></label>
+                        <button id="fetch-btn" class="btn btn-success btn-sm" disabled>
+                            <span id="fetch-btn-text">Fetch OI Data</span>
+                        </button>
+                    </div>
+
+                    <!-- Auto-refresh Toggle -->
+                    <div class="form-control">
+                        <label class="label py-0"><span class="label-text text-xs">Auto-refresh (5m)</span></label>
+                        <input type="checkbox" id="auto-refresh" class="toggle toggle-success toggle-sm" />
+                    </div>
+
+                    <!-- Live Stats -->
+                    <div class="flex-1 flex justify-end gap-2 flex-wrap">
+                        <div class="metric-badge badge">
+                            <span class="text-xs text-green-600">Spot:</span>
+                            <span id="spot-price" class="ml-1 font-bold">-</span>
+                        </div>
+                        <div class="metric-badge badge">
+                            <span class="text-xs text-green-600">ATM:</span>
+                            <span id="atm-strike" class="ml-1 font-bold">-</span>
+                        </div>
+                        <div class="metric-badge badge">
+                            <span class="text-xs text-green-600">PCR:</span>
+                            <span id="pcr-value" class="ml-1 font-bold">-</span>
+                        </div>
+                        <div class="metric-badge badge">
+                            <span class="text-xs text-green-600">CE OI:</span>
+                            <span id="total-ce-oi" class="ml-1 font-bold">-</span>
+                        </div>
+                        <div class="metric-badge badge">
+                            <span class="text-xs text-green-600">PE OI:</span>
+                            <span id="total-pe-oi" class="ml-1 font-bold">-</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Three Column Layout -->
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+            <!-- Column 1: Futures Chart (50% on desktop, full on mobile) -->
+            <div class="lg:col-span-1 card bg-base-200 shadow-xl border border-green-900">
+                <div class="column-header">Futures (5m - 7 Days)</div>
+                <div class="card-body p-2">
+                    <div id="futures-chart"></div>
+                </div>
+            </div>
+
+            <!-- Column 2 & 3 Container (50% on desktop) -->
+            <div class="lg:col-span-1 grid grid-cols-1 md:grid-cols-2 gap-4">
+                <!-- Column 2: Current OI -->
+                <div class="card bg-base-200 shadow-xl border border-green-900">
+                    <div class="column-header">Current OI</div>
+                    <div class="card-body p-2">
+                        <div id="oi-levels" class="oi-chart">
+                            <div class="loading-spinner"></div>
+                            <p class="text-center text-sm mt-2">Select symbol and fetch data</p>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Column 3: Daily OI Changes -->
+                <div class="card bg-base-200 shadow-xl border border-green-900">
+                    <div class="column-header">Daily OI Change</div>
+                    <div class="card-body p-2">
+                        <div id="oi-changes" class="oi-chart">
+                            <div class="loading-spinner"></div>
+                            <p class="text-center text-sm mt-2">Select symbol and fetch data</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="/static/js/market_profile.js"></script>
+</body>
+</html>
