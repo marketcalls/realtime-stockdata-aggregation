@@ -1,10 +1,12 @@
-from flask import Flask, render_template, request, jsonify, session
+from flask import Flask, render_template, request, jsonify, session, Response
 from flask_socketio import SocketIO, emit, join_room, leave_room
 import json
 import os
 import sys
 import io
+import queue
 from datetime import datetime
+from time import time as monotime
 import threading
 import logging
 from config_manager import ConfigManager
@@ -48,6 +50,48 @@ config_manager = ConfigManager()
 questdb_client = QuestDBClient()
 stream_client = None
 candle_aggregator = CandleAggregator(questdb_client)
+
+# SSE subscriber management
+sse_subscribers = {}  # {room: {client_id: queue.Queue}}
+sse_lock = threading.Lock()
+sse_last_emit = {}  # {room: timestamp} for throttling
+
+
+def sse_subscribe(room, client_id):
+    """Add an SSE subscriber to a room"""
+    q = queue.Queue(maxsize=50)
+    with sse_lock:
+        if room not in sse_subscribers:
+            sse_subscribers[room] = {}
+        sse_subscribers[room][client_id] = q
+    return q
+
+
+def sse_unsubscribe(room, client_id):
+    """Remove an SSE subscriber from a room"""
+    with sse_lock:
+        if room in sse_subscribers:
+            sse_subscribers[room].pop(client_id, None)
+            if not sse_subscribers[room]:
+                del sse_subscribers[room]
+
+
+def sse_broadcast(room, data):
+    """Broadcast data to all SSE subscribers in a room (throttled to 2/sec)"""
+    now = monotime()
+    if now - sse_last_emit.get(room, 0) < 0.5:
+        return  # Throttle: max 2 updates per second per room
+    sse_last_emit[room] = now
+
+    with sse_lock:
+        clients = sse_subscribers.get(room, {})
+        for client_id, q in list(clients.items()):
+            try:
+                # Non-blocking put, drop if queue full (slow client)
+                q.put_nowait(data)
+            except queue.Full:
+                pass
+
 
 # Store real-time metrics
 metrics = {
@@ -174,9 +218,6 @@ def handle_websocket_data(data):
                 spread = data['ask'] - data['bid']
                 metrics['spreads'][symbol] = spread
 
-            # Data is already being streamed to charts via OpenAlgo WebSocket
-            # No need for separate broadcasting
-
             # Store in QuestDB with last_trade_quantity (NOT total volume)
             if 'ltp' in data and data['ltp'] is not None:
                 # Store last_trade_quantity ONLY, not the day's total volume
@@ -185,6 +226,16 @@ def handle_websocket_data(data):
                 success = questdb_client.insert_ltp(symbol, data['ltp'], trade_qty)
                 if not success:
                     app.logger.warning(f"Failed to store LTP for {symbol}")
+
+                # Broadcast candle updates via SSE to subscribed clients
+                with sse_lock:
+                    active_rooms = set(sse_subscribers.keys())
+                for tf in ['1m', '3m', '5m', '15m', '30m', '1h', '1d']:
+                    room = f"{symbol}_{tf}"
+                    if room in active_rooms:
+                        candle = candle_aggregator._get_current_candle(symbol, tf)
+                        if candle:
+                            sse_broadcast(room, candle)
 
             # Store quote data with OHLC information
             if data.get('type') == 'quote':
@@ -387,6 +438,47 @@ def get_candles(symbol):
             'message': str(e),
             'symbol': symbol
         }), 500
+
+# SSE endpoint for real-time candle streaming
+@app.route('/api/stream/<symbol>/<timeframe>')
+def sse_stream(symbol, timeframe):
+    """SSE endpoint - streams candle updates for a symbol/timeframe"""
+    room = f"{symbol}_{timeframe}"
+    client_id = f"{request.remote_addr}_{id(request)}"
+    q = sse_subscribe(room, client_id)
+
+    # Send current candle immediately
+    candle = candle_aggregator._get_current_candle(symbol, timeframe)
+    if candle:
+        try:
+            q.put_nowait(candle)
+        except queue.Full:
+            pass
+
+    def event_stream():
+        try:
+            while True:
+                try:
+                    data = q.get(timeout=30)  # 30s timeout for keepalive
+                    yield f"data: {json.dumps(data)}\n\n"
+                except queue.Empty:
+                    # Send keepalive comment to prevent connection timeout
+                    yield ": keepalive\n\n"
+        except GeneratorExit:
+            pass
+        finally:
+            sse_unsubscribe(room, client_id)
+
+    return Response(
+        event_stream(),
+        mimetype='text/event-stream',
+        headers={
+            'Cache-Control': 'no-cache',
+            'X-Accel-Buffering': 'no',
+            'Connection': 'keep-alive'
+        }
+    )
+
 
 # WebSocket events for real-time candle streaming
 @socketio.on('connect')

@@ -7,7 +7,7 @@
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://cdn.jsdelivr.net/npm/daisyui@4.4.2/dist/full.min.css" rel="stylesheet">
     <script src="https://unpkg.com/lightweight-charts@4.1.0/dist/lightweight-charts.standalone.production.js"></script>
-    <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+    <!-- SSE used for real-time streaming, no Socket.IO needed -->
     <style>
         :root {
             --primary: #10b981;
@@ -156,7 +156,6 @@
         let barSeries = null;
         let volumeSeries = null;
         let currentSeries = null;
-        let ws = null;
         let currentSymbol = null;
         let currentTimeframe = '1m';
         let streamingEnabled = true;
@@ -538,133 +537,100 @@
             }
         }
 
-        // Connect to Socket.IO for real-time candle updates from QuestDB
-        let pollingInterval = null;
-        function connectWebSocket() {
-            // For now, just show as connected since data is coming from API
-            // Socket.IO integration can be added later if needed
-            console.log('Using API polling for updates');
-            document.getElementById('connection-status').className = 'badge badge-success';
-            document.getElementById('connection-status').textContent = 'Connected';
+        // SSE (Server-Sent Events) for real-time candle updates
+        let eventSource = null;
+        let quoteInterval = null;
 
-            // Clear existing interval if any
-            if (pollingInterval) {
-                clearInterval(pollingInterval);
+        function connectSSE() {
+            // Close existing connection
+            if (eventSource) {
+                eventSource.close();
+                eventSource = null;
+            }
+            if (quoteInterval) {
+                clearInterval(quoteInterval);
             }
 
-            // Poll for updates every 2 seconds for 1m, longer for other timeframes
-            pollingInterval = setInterval(() => {
-                if (currentSymbol && streamingEnabled) {
-                    loadLatestCandle(currentSymbol, currentTimeframe);
-                }
-            }, currentTimeframe === '1m' ? 1000 : 10000);
-        }
+            if (!currentSymbol) return;
 
-        // Load latest candle data
-        async function loadLatestCandle(symbol, timeframe) {
-            // Don't update if we're loading a different symbol
-            if (symbol !== currentSymbol) return;
+            const url = `/api/stream/${currentSymbol}/${currentTimeframe}`;
+            console.log('Connecting SSE:', url);
+            eventSource = new EventSource(url);
 
-            try {
-                // Also refresh quote data from ticks_quote table
-                await loadQuoteData(symbol);
+            eventSource.onopen = () => {
+                document.getElementById('connection-status').className = 'badge badge-success';
+                document.getElementById('connection-status').textContent = 'Connected';
+            };
 
-                // Only fetch recent candles for update, not replace
-                const response = await fetch(`/api/candles/${symbol}?timeframe=${timeframe}&limit=2`);
-                const data = await response.json();
-
-                if (data.status === 'success' && data.candles && data.candles.length > 0) {
-                    // Get the latest candle for update (not full replacement)
-                    const latestCandle = data.candles[data.candles.length - 1];
-
-                    // Validate candle data
-                    if (latestCandle &&
-                        latestCandle.open !== null &&
-                        latestCandle.high !== null &&
-                        latestCandle.low !== null &&
-                        latestCandle.close !== null &&
-                        latestCandle.time !== null) {
-
-                        // Check if we should update or skip
-                        if (currentSeries && lastCandle) {
-                            // Only update if it's the same candle time or a new candle
-                            if (latestCandle.time === lastCandle.time) {
-                                // Update existing candle
-                                currentSeries.update({
-                                    time: latestCandle.time,
-                                    open: latestCandle.open || 0,
-                                    high: latestCandle.high || 0,
-                                    low: latestCandle.low || 0,
-                                    close: latestCandle.close || 0
-                                });
-
-                                // Update volume
-                                if (volumeSeries) {
-                                    volumeSeries.update({
-                                        time: latestCandle.time,
-                                        value: latestCandle.volume || 0,
-                                        color: (latestCandle.close >= latestCandle.open) ? 'rgba(16, 185, 129, 0.3)' : 'rgba(239, 68, 68, 0.3)'
-                                    });
-                                }
-                            } else if (latestCandle.time > lastCandle.time) {
-                                // It's a new candle, need to reload to add it properly
-                                console.log('New candle detected, reloading chart data');
-                                loadChartData(symbol, timeframe);
-                                return;
-                            }
-                            // If latestCandle.time < lastCandle.time, skip it (old data)
-                        }
-
-                        // Store for next comparison
-                        lastCandle = latestCandle;
-
-                        // Update metrics with the latest candle
-                        updateMetrics(latestCandle);
-                        document.getElementById('last-update').textContent = new Date().toLocaleTimeString('en-IN', {
-                            timeZone: 'Asia/Kolkata',
-                            hour12: true
-                        });
+            eventSource.onmessage = (event) => {
+                if (!streamingEnabled) return;
+                try {
+                    const candle = JSON.parse(event.data);
+                    if (candle && candle.time != null && candle.open != null) {
+                        updateCandleFromSSE(candle);
                     }
+                } catch (e) {
+                    console.error('SSE parse error:', e);
                 }
-            } catch (error) {
-                console.error('Failed to load latest candle:', error);
-            }
+            };
+
+            eventSource.onerror = () => {
+                document.getElementById('connection-status').className = 'badge badge-error';
+                document.getElementById('connection-status').textContent = 'Reconnecting...';
+                // EventSource auto-reconnects
+            };
+
+            // Poll quote data (OHLCV metrics) at a slower rate since SSE handles candles
+            quoteInterval = setInterval(() => {
+                if (currentSymbol && streamingEnabled) {
+                    loadQuoteData(currentSymbol);
+                }
+            }, 5000);
         }
 
-        // Update candle from QuestDB aggregated data
-        function updateCandleFromQuestDB(candle) {
-            if (!currentSeries || !candle) return;
+        function updateCandleFromSSE(candle) {
+            if (!currentSeries) return;
 
-            // Update or add the candle
-            currentSeries.update({
-                time: candle.time,
-                open: candle.open,
-                high: candle.high,
-                low: candle.low,
-                close: candle.close,
-                value: candle.close
-            });
-
-            // Update volume chart (but not the display since we get that from quote data)
-            if (volumeSeries) {
-                // Use dayStats volume for display if available
-                const displayVolume = dayStats && dayStats.volume ? dayStats.volume : candle.volume;
-                volumeSeries.update({
+            if (lastCandle && candle.time === lastCandle.time) {
+                // Update existing candle in-place
+                currentSeries.update({
                     time: candle.time,
-                    value: displayVolume,
-                    color: candle.close >= candle.open ? 'rgba(16, 185, 129, 0.3)' : 'rgba(239, 68, 68, 0.3)'
+                    open: candle.open || 0,
+                    high: candle.high || 0,
+                    low: candle.low || 0,
+                    close: candle.close || 0,
+                    value: candle.close || 0
                 });
+
+                if (volumeSeries) {
+                    volumeSeries.update({
+                        time: candle.time,
+                        value: candle.volume || 0,
+                        color: (candle.close >= candle.open) ? 'rgba(16, 185, 129, 0.3)' : 'rgba(239, 68, 68, 0.3)'
+                    });
+                }
+            } else if (!lastCandle || candle.time > lastCandle.time) {
+                // New candle — append it
+                currentSeries.update({
+                    time: candle.time,
+                    open: candle.open || 0,
+                    high: candle.high || 0,
+                    low: candle.low || 0,
+                    close: candle.close || 0,
+                    value: candle.close || 0
+                });
+
+                if (volumeSeries) {
+                    volumeSeries.update({
+                        time: candle.time,
+                        value: candle.volume || 0,
+                        color: (candle.close >= candle.open) ? 'rgba(16, 185, 129, 0.3)' : 'rgba(239, 68, 68, 0.3)'
+                    });
+                }
             }
 
             lastCandle = candle;
-            // Don't let candle volume overwrite quote volume in dayStats
-            if (dayStats && dayStats.volume) {
-                const preservedVolume = dayStats.volume;
-                updateMetrics(candle);
-                dayStats.volume = preservedVolume; // Restore the correct volume from quote
-            } else {
-                updateMetrics(candle);
-            }
+            updateMetrics(candle);
             document.getElementById('last-update').textContent = new Date().toLocaleTimeString('en-IN', {
                 timeZone: 'Asia/Kolkata',
                 hour12: true
@@ -788,26 +754,11 @@
 
             loadChartData(currentSymbol, currentTimeframe);
 
-            // Update Socket.IO subscription
-            if (window.candleSocket && window.candleSocket.connected) {
-                // Unsubscribe from previous symbol
-                if (previousSymbol) {
-                    window.candleSocket.emit('unsubscribe', {
-                        symbol: previousSymbol,
-                        timeframe: currentTimeframe
-                    });
-                }
-
-                // Subscribe to new symbol
-                window.candleSocket.emit('subscribe', {
-                    symbol: currentSymbol,
-                    timeframe: currentTimeframe
-                });
-            }
+            // Reconnect SSE to new symbol
+            connectSSE();
         });
 
         document.getElementById('timeframe-selector').addEventListener('change', (e) => {
-            const previousTimeframe = currentTimeframe;
             currentTimeframe = e.target.value;
             if (currentSymbol) {
                 // Clear existing data before loading new timeframe
@@ -820,23 +771,8 @@
 
                 loadChartData(currentSymbol, currentTimeframe);
 
-                // Restart polling with new timeframe interval
-                connectWebSocket();
-
-                // Update Socket.IO subscription
-                if (window.candleSocket && window.candleSocket.connected) {
-                    // Unsubscribe from previous timeframe
-                    window.candleSocket.emit('unsubscribe', {
-                        symbol: currentSymbol,
-                        timeframe: previousTimeframe
-                    });
-
-                    // Subscribe to new timeframe
-                    window.candleSocket.emit('subscribe', {
-                        symbol: currentSymbol,
-                        timeframe: currentTimeframe
-                    });
-                }
+                // Reconnect SSE to new timeframe
+                connectSSE();
             }
         });
 
@@ -867,7 +803,7 @@
             // Initialize after symbols are loaded
             initSymbolSelector();
             initChart();
-            connectWebSocket();
+            connectSSE();
 
             // Load initial data
             if (currentSymbol) {
